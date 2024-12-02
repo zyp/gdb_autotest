@@ -24,6 +24,15 @@ if not '--debug' in sys.argv[1:]: # TODO: Use click or something.
     logging.getLogger('pygdbmi').setLevel('ERROR')
 
 @contextmanager
+def measure_time():
+    t = None
+    try:
+        start = time.perf_counter()
+        yield lambda: t
+    finally:
+        t = time.perf_counter() - start
+
+@contextmanager
 def start_bmda():
     try:
         with open('bmda_log.txt', 'w') as bmda_log:
@@ -81,7 +90,16 @@ class Gdb:
         return self.gdb.write('-gdb-version')[0]['payload'].strip()
 
     def monitor(self, command):
-        return [msg['payload'].strip() for msg in self.gdb.write(f'interpreter console "monitor {command}"') if msg['type'] == 'target']
+        lines = []
+        messages = self.gdb.write(f'interpreter console "monitor {command}"')
+        while True:
+            for msg in messages:
+                match msg['type']:
+                    case 'target':
+                        lines.append(msg['payload'].strip())
+                    case 'result':
+                        return lines
+            messages = self.gdb.get_gdb_response()
 
     def memory_map(self):
         lines = [msg['payload'].strip() for msg in self.gdb.write(f'interpreter console "info mem"') if msg['type'] == 'console']
@@ -100,8 +118,16 @@ class Gdb:
         return regions
 
     def compare_sections(self):
-        lines = [msg['payload'].strip() for msg in self.gdb.write(f'interpreter console "compare-sections"') if msg['type'] == 'console']
-        return all(line.endswith(': matched.') for line in lines)
+        lines = []
+        messages = self.gdb.write(f'interpreter console "compare-sections"')
+        while True:
+            for msg in messages:
+                match msg['type']:
+                    case 'console':
+                        lines.append(msg['payload'].strip())
+                    case 'result':
+                        return all(line.endswith(': matched.') for line in lines)
+            messages = self.gdb.get_gdb_response()
 
     def peek(self, addr, type = 'unsigned'):
         res, = filter_result(self.gdb.write(f'-data-evaluate-expression {{{type}}}{addr:#x}'))
@@ -131,7 +157,10 @@ class Gdb:
         return res['message'] == 'done'
 
     def load(self):
-        res, = filter_result(self.gdb.write(f'-target-download'))
+        messages = list(filter_result(self.gdb.write(f'-target-download')))
+        while not messages:
+            messages = list(filter_result(self.gdb.get_gdb_response()))
+        res, = messages
         assert res['message'] in ['done', 'error']
         return res['message'] == 'done'
     
@@ -170,7 +199,7 @@ class BlackmagicGdb(Gdb):
     def erase_mass(self):
         res = self.monitor('erase_mass')
 
-        return res == ['Erasing device Flash:', 'done']
+        return (res[0], res[-1]) == ('Erasing device Flash:', 'done')
 
 def main():
     with start_bmda():
@@ -179,6 +208,8 @@ def main():
         for line in gdb.bmd_version():
             logger.info(line)
     
+        gdb.monitor('frequency 20000000')
+
         # Find the device and get it into a known initial state (erased):
 
         logger.info('Turning on target')
@@ -282,6 +313,23 @@ def main():
 
         if memory_map:
             return logger.error(f'Unexpected regions in memory_map: {memory_map}')
+
+        # Measure writing performance:
+
+        logger.info('Filling rram with random data')
+
+        if not gdb.file('nrf54l_random_1524k.hex'):
+            return logger.error('GDB could not open hex file')
+
+        with measure_time() as t:
+            if not gdb.load():
+                return logger.error('Writing firmware failed')
+        logger.info(f'Wrote 1524k in {t():.2f}s, {1524 / t():.2f}kB/s')
+
+        with measure_time() as t:
+            if not gdb.compare_sections():
+                return logger.error('Verifying rram contents failed')
+        logger.info(f'Verified 1524k in {t():.2f}s, {1524 / t():.2f}kB/s')
 
         # Load firmware:
 
